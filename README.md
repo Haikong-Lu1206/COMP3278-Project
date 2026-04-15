@@ -1,37 +1,34 @@
 # HKUgram
 
-Local social media web app for COMP3278 Scenario 2.
+HKUgram is a local social media web app for COMP3278 Scenario 2, built with Python + SQLite and a server-rendered frontend.
 
-## Included
+## Features
 
-- unique usernames
-- image posts with captions and timestamps
-- direct image visualization in the feed
-- like and unlike
-- comments
-- automatic like and comment count maintenance via triggers
-- sorting by latest, popularity, discussion, and trending score
-- user-specific post history
-- analytics dashboard
-- tagging, bookmarks, search, and a safe Text-to-SQL console
-- concurrent access via `ThreadingHTTPServer` and SQLite WAL mode
+- account registration/login with unique usernames
+- post creation (title/body/image), feed browsing, post detail pages
+- likes, comments, bookmarks, follows, and notifications
+- direct messaging (1:1 and group chats)
+- group chat creation with member search filter and **add user by username**
+- analytics dashboard and Ask HKUgram (safe NL-to-SQL workflow)
+- light/dark theme toggle with updated UI system
+- concurrent request handling via `ThreadingHTTPServer` + SQLite WAL mode
 
-## Run
+## Run locally
 
 ```bash
 python app.py
 ```
 
-Then open `http://127.0.0.1:8000`.
+Open: `http://127.0.0.1:8000`
 
-## API-Backed Natural Language Queries
+## Ask HKUgram (Natural Language Query)
 
-The `Ask HKUgram` page supports two modes:
+`/query` supports:
 
-- default: built-in rule-based query translation
-- with DeepSeek configured: model-backed natural language to SQL
+- **default mode**: built-in rule-based NL → SQL
+- **API mode**: DeepSeek-backed NL → SQL (if configured)
 
-Set these environment variables to enable the API-backed mode:
+Set environment variables to enable API mode:
 
 ```bash
 set DEEPSEEK_API_KEY=your_api_key_here
@@ -39,7 +36,7 @@ set DEEPSEEK_MODEL=deepseek-chat
 python app.py
 ```
 
-In PowerShell, use:
+PowerShell:
 
 ```powershell
 $env:DEEPSEEK_API_KEY="your_api_key_here"
@@ -47,45 +44,27 @@ $env:DEEPSEEK_MODEL="deepseek-chat"
 python app.py
 ```
 
-Who should enter the key:
+Safety constraints:
 
-- the person running or deploying the app
-- not normal end users in the browser UI
+- only a single read-only `SELECT` query is allowed
+- writes/schema changes are blocked
+- automatic fallback to rule-based mode if API is unavailable
 
-The key is read from the server environment before the app starts.
+## Data persistence
 
-Safety rules:
+Primary DB: `data/hkugram.db`
 
-- the app only accepts a single read-only `SELECT` query
-- write operations and schema changes are rejected
-- if the API is unavailable, the app falls back to the built-in rule-based behavior
+- all user/content actions are persisted in SQLite
+- snapshot saved at shutdown to `data/snapshots/hkugram-latest.db`
+- automatic restore from snapshot if primary DB is missing
 
-## Local Persistence
+## Deploy (Render)
 
-The local version saves all data to `data/hkugram.db`.
+The repository includes `render.yaml` for quick Render setup.
 
-- user registrations, posts, comments, likes, and bookmarks are written to SQLite immediately
-- when the app shuts down, it also saves a snapshot to `data/snapshots/hkugram-latest.db`
-- if the main database file is missing on the next start, the app restores from that snapshot automatically
+1. Push to GitHub
+2. Create a new Render Web Service and connect the repo
+3. Let Render detect `render.yaml`
+4. Deploy and open the generated URL
 
-For normal local use, you can stop the server and start it again later without losing your data.
-
-## Free Public Deployment
-
-The repo now includes [render.yaml](/c:/Users/Duckt/Desktop/COMP3278%20Project/render.yaml) so it can be deployed as a free Render web service with a public URL.
-
-### Render Steps
-
-1. Push this project to GitHub.
-2. Create a new Web Service on Render and connect the repository.
-3. Render should detect `render.yaml` automatically.
-4. Deploy and open the generated `onrender.com` URL.
-
-### Important Limitation
-
-This project currently uses local SQLite (`data/hkugram.db`). On a free public host, that means user-created data is not production-safe:
-
-- good enough for a course demo
-- not reliable for long-term public usage
-
-If you need persistent public data later, the next step is moving from SQLite to PostgreSQL.
+> Note: this project uses local SQLite, which is fine for demos but not ideal for long-term production persistence.
