@@ -65,6 +65,72 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     FOREIGN KEY (post_id) REFERENCES posts(post_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS follows (
+    follow_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    follower_id INTEGER NOT NULL,
+    following_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (follower_id, following_id),
+    CHECK (follower_id != following_id),
+    FOREIGN KEY (follower_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (following_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT '',
+    is_group INTEGER NOT NULL DEFAULT 0 CHECK (is_group IN (0, 1)),
+    created_by INTEGER REFERENCES users(user_id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS conversation_members (
+    conversation_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    last_read_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (conversation_id, user_id),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL,
+    sender_id INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    message_type TEXT NOT NULL DEFAULT 'text',
+    image_url TEXT NOT NULL DEFAULT '',
+    shared_post_id INTEGER REFERENCES posts(post_id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    FOREIGN KEY (sender_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS message_reactions (
+    reaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    reaction TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (message_id, user_id),
+    FOREIGN KEY (message_id) REFERENCES messages(message_id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_id INTEGER NOT NULL,
+    actor_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
+    preview_text TEXT NOT NULL DEFAULT '',
+    is_read INTEGER NOT NULL DEFAULT 0 CHECK (is_read IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (recipient_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (actor_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS query_history (
     query_id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -82,6 +148,13 @@ CREATE INDEX IF NOT EXISTS idx_likes_post_user ON likes(post_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_comments_post_created_at ON comments(post_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_post_tags_tag_post ON post_tags(tag_id, post_id);
 CREATE INDEX IF NOT EXISTS idx_bookmarks_user_post ON bookmarks(user_id, post_id);
+CREATE INDEX IF NOT EXISTS idx_follows_follower_following ON follows(follower_id, following_id);
+CREATE INDEX IF NOT EXISTS idx_follows_following_follower ON follows(following_id, follower_id);
+CREATE INDEX IF NOT EXISTS idx_conversation_members_user ON conversation_members(user_id, conversation_id);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_message_reactions_message ON message_reactions(message_id, reaction);
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_unread_created ON notifications(recipient_id, is_read, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_created ON notifications(recipient_id, created_at DESC);
 
 CREATE TRIGGER IF NOT EXISTS trg_likes_insert
 AFTER INSERT ON likes

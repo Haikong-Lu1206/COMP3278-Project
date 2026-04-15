@@ -90,6 +90,58 @@ bookmarks(
   created_at TEXT
 )
 
+follows(
+  follow_id INTEGER PRIMARY KEY,
+  follower_id INTEGER REFERENCES users.user_id,
+  following_id INTEGER REFERENCES users.user_id,
+  created_at TEXT
+)
+
+conversations(
+  conversation_id INTEGER PRIMARY KEY,
+  title TEXT,
+  is_group INTEGER,
+  created_by INTEGER,
+  created_at TEXT
+)
+
+conversation_members(
+  conversation_id INTEGER REFERENCES conversations.conversation_id,
+  user_id INTEGER REFERENCES users.user_id,
+  last_read_at TEXT
+)
+
+messages(
+  message_id INTEGER PRIMARY KEY,
+  conversation_id INTEGER REFERENCES conversations.conversation_id,
+  sender_id INTEGER REFERENCES users.user_id,
+  body TEXT,
+  message_type TEXT,
+  image_url TEXT,
+  shared_post_id INTEGER REFERENCES posts.post_id,
+  created_at TEXT
+)
+
+message_reactions(
+  reaction_id INTEGER PRIMARY KEY,
+  message_id INTEGER REFERENCES messages.message_id,
+  user_id INTEGER REFERENCES users.user_id,
+  reaction TEXT,
+  created_at TEXT
+)
+
+notifications(
+  notification_id INTEGER PRIMARY KEY,
+  recipient_id INTEGER REFERENCES users.user_id,
+  actor_id INTEGER REFERENCES users.user_id,
+  event_type TEXT,
+  target_type TEXT,
+  target_id INTEGER,
+  preview_text TEXT,
+  is_read INTEGER,
+  created_at TEXT
+)
+
 Rules:
 - Only generate one read-only SQL query.
 - Use SQLite syntax.
@@ -147,6 +199,8 @@ def init_db() -> None:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         ensure_user_auth_columns(conn)
         ensure_post_content_columns(conn)
+        ensure_messaging_columns(conn)
+        ensure_notifications_columns(conn)
         count = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
         if count == 0:
             seed_database(conn)
@@ -187,6 +241,76 @@ def ensure_post_content_columns(conn: sqlite3.Connection) -> None:
     if "body" not in columns:
         conn.execute("ALTER TABLE posts ADD COLUMN body TEXT NOT NULL DEFAULT ''")
         conn.commit()
+
+
+def ensure_messaging_columns(conn: sqlite3.Connection) -> None:
+    conversation_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(conversations)")
+    }
+    if "title" not in conversation_columns:
+        conn.execute("ALTER TABLE conversations ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+    if "is_group" not in conversation_columns:
+        conn.execute("ALTER TABLE conversations ADD COLUMN is_group INTEGER NOT NULL DEFAULT 0")
+    if "created_by" not in conversation_columns:
+        conn.execute("ALTER TABLE conversations ADD COLUMN created_by INTEGER")
+
+    message_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(messages)")
+    }
+    if "message_type" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'text'")
+    if "image_url" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN image_url TEXT NOT NULL DEFAULT ''")
+    if "shared_post_id" not in message_columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN shared_post_id INTEGER")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_reactions (
+            reaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            reaction TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (message_id, user_id),
+            FOREIGN KEY (message_id) REFERENCES messages(message_id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_message_reactions_message ON message_reactions(message_id, reaction)"
+    )
+    conn.commit()
+
+
+def ensure_notifications_columns(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notifications (
+            notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_id INTEGER NOT NULL,
+            actor_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id INTEGER NOT NULL,
+            preview_text TEXT NOT NULL DEFAULT '',
+            is_read INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (recipient_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            FOREIGN KEY (actor_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notifications_recipient_unread_created ON notifications(recipient_id, is_read, created_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notifications_recipient_created ON notifications(recipient_id, created_at DESC)"
+    )
+    conn.commit()
 
 
 def seed_database(conn: sqlite3.Connection) -> None:
@@ -327,6 +451,56 @@ def relative_time(raw_value: str) -> str:
     return f"{minutes}m ago"
 
 
+def create_notification(
+    conn: sqlite3.Connection,
+    *,
+    recipient_id: int,
+    actor_id: int,
+    event_type: str,
+    target_type: str,
+    target_id: int,
+    preview_text: str,
+) -> None:
+    if recipient_id == actor_id:
+        return
+    conn.execute(
+        """
+        INSERT INTO notifications (recipient_id, actor_id, event_type, target_type, target_id, preview_text)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (recipient_id, actor_id, event_type, target_type, target_id, preview_text[:280]),
+    )
+
+
+def fetch_notifications(conn: sqlite3.Connection, viewer_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT n.notification_id, n.recipient_id, n.actor_id, n.event_type, n.target_type, n.target_id,
+               n.preview_text, n.is_read, n.created_at,
+               actor.username AS actor_username,
+               actor.display_name AS actor_display_name,
+               actor.avatar_url AS actor_avatar_url,
+               m.conversation_id AS message_conversation_id
+        FROM notifications n
+        JOIN users actor ON actor.user_id = n.actor_id
+        LEFT JOIN messages m ON n.target_type = 'message' AND m.message_id = n.target_id
+        WHERE n.recipient_id = ?
+        ORDER BY n.created_at DESC, n.notification_id DESC
+        LIMIT 120
+        """,
+        (viewer_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def unread_notification_count(conn: sqlite3.Connection, viewer_id: int) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS unread_count FROM notifications WHERE recipient_id = ? AND is_read = 0",
+        (viewer_id,),
+    ).fetchone()
+    return int(row["unread_count"])
+
+
 def fetch_users(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT user_id, username, display_name, bio, avatar_url FROM users ORDER BY username"
@@ -334,21 +508,311 @@ def fetch_users(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def fetch_profile_summary(conn: sqlite3.Connection, user_id: int) -> dict[str, Any]:
-    return dict(
-        conn.execute(
-            """
-            SELECT u.user_id, u.username, u.display_name, u.bio, u.avatar_url,
-                   COUNT(DISTINCT p.post_id) AS post_total,
-                   COALESCE(SUM(p.like_count), 0) AS like_total,
-                   COALESCE(SUM(p.comment_count), 0) AS comment_total
-            FROM users u
-            LEFT JOIN posts p ON p.user_id = u.user_id
-            WHERE u.user_id = ?
-            GROUP BY u.user_id
-            """,
-            (user_id,),
+    row = conn.execute(
+        """
+        SELECT u.user_id, u.username, u.display_name, u.bio, u.avatar_url,
+               COUNT(DISTINCT p.post_id) AS post_total,
+               COALESCE(SUM(p.like_count), 0) AS like_total,
+               COALESCE(SUM(p.comment_count), 0) AS comment_total,
+               (SELECT COUNT(*) FROM follows f WHERE f.following_id = u.user_id) AS follower_total,
+               (SELECT COUNT(*) FROM follows f WHERE f.follower_id = u.user_id) AS following_total
+        FROM users u
+        LEFT JOIN posts p ON p.user_id = u.user_id
+        WHERE u.user_id = ?
+        GROUP BY u.user_id
+        """,
+        (user_id,),
+    ).fetchone()
+    if not row:
+        raise AppError("User not found.")
+    return dict(row)
+
+
+def fetch_follow_state(conn: sqlite3.Connection, viewer_id: int, profile_user_id: int) -> dict[str, Any]:
+    is_self = viewer_id == profile_user_id
+    is_following = False
+    if not is_self:
+        existing = conn.execute(
+            "SELECT follow_id FROM follows WHERE follower_id = ? AND following_id = ?",
+            (viewer_id, profile_user_id),
         ).fetchone()
+        is_following = bool(existing)
+    followers = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT u.user_id, u.username, u.display_name
+            FROM follows f
+            JOIN users u ON u.user_id = f.follower_id
+            WHERE f.following_id = ?
+            ORDER BY f.created_at DESC, u.username ASC
+            LIMIT 30
+            """,
+            (profile_user_id,),
+        )
+    ]
+    following = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT u.user_id, u.username, u.display_name
+            FROM follows f
+            JOIN users u ON u.user_id = f.following_id
+            WHERE f.follower_id = ?
+            ORDER BY f.created_at DESC, u.username ASC
+            LIMIT 30
+            """,
+            (profile_user_id,),
+        )
+    ]
+    return {"is_self": is_self, "is_following": is_following, "followers": followers, "following": following}
+
+
+def get_or_create_direct_conversation(conn: sqlite3.Connection, user_a_id: int, user_b_id: int) -> int:
+    if user_a_id == user_b_id:
+        raise AppError("You cannot message yourself.")
+    existing = conn.execute(
+        """
+        SELECT cm_a.conversation_id
+        FROM conversation_members cm_a
+        JOIN conversation_members cm_b ON cm_b.conversation_id = cm_a.conversation_id
+        WHERE cm_a.user_id = ? AND cm_b.user_id = ?
+          AND (
+              SELECT COUNT(*)
+              FROM conversation_members cm_total
+              WHERE cm_total.conversation_id = cm_a.conversation_id
+          ) = 2
+        LIMIT 1
+        """,
+        (user_a_id, user_b_id),
+    ).fetchone()
+    if existing:
+        return int(existing["conversation_id"])
+    created_at = datetime.now().replace(microsecond=0).isoformat(sep=" ")
+    conn.execute(
+        "INSERT INTO conversations (title, is_group, created_by, created_at) VALUES ('', 0, ?, ?)",
+        (user_a_id, created_at),
     )
+    conversation_id = int(conn.execute("SELECT last_insert_rowid() AS conversation_id").fetchone()["conversation_id"])
+    conn.execute(
+        "INSERT INTO conversation_members (conversation_id, user_id, last_read_at) VALUES (?, ?, ?)",
+        (conversation_id, user_a_id, created_at),
+    )
+    conn.execute(
+        "INSERT INTO conversation_members (conversation_id, user_id, last_read_at) VALUES (?, ?, ?)",
+        (conversation_id, user_b_id, created_at),
+    )
+    conn.commit()
+    return conversation_id
+
+
+def create_group_conversation(
+    conn: sqlite3.Connection,
+    creator_id: int,
+    title: str,
+    member_ids: list[int],
+) -> int:
+    cleaned_title = title.strip() or "Group chat"
+    unique_member_ids = sorted(set(member_ids))
+    if creator_id in unique_member_ids:
+        unique_member_ids.remove(creator_id)
+    if len(unique_member_ids) < 2:
+        raise AppError("Group chats need at least 3 people including you.")
+    placeholders = ",".join("?" for _ in unique_member_ids)
+    rows = conn.execute(
+        f"SELECT user_id FROM users WHERE user_id IN ({placeholders})",
+        unique_member_ids,
+    ).fetchall()
+    found_ids = {int(row["user_id"]) for row in rows}
+    missing = [member_id for member_id in unique_member_ids if member_id not in found_ids]
+    if missing:
+        raise AppError("One or more selected members do not exist.")
+    created_at = datetime.now().replace(microsecond=0).isoformat(sep=" ")
+    conn.execute(
+        "INSERT INTO conversations (title, is_group, created_by, created_at) VALUES (?, 1, ?, ?)",
+        (cleaned_title, creator_id, created_at),
+    )
+    conversation_id = int(conn.execute("SELECT last_insert_rowid() AS conversation_id").fetchone()["conversation_id"])
+    for user_id in [creator_id, *unique_member_ids]:
+        conn.execute(
+            "INSERT INTO conversation_members (conversation_id, user_id, last_read_at) VALUES (?, ?, ?)",
+            (conversation_id, user_id, created_at),
+        )
+    conn.commit()
+    return conversation_id
+
+
+def fetch_message_threads(conn: sqlite3.Connection, viewer_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT c.conversation_id,
+               c.title,
+               c.is_group,
+               partner.user_id AS partner_user_id,
+               partner.username AS partner_username,
+               partner.display_name AS partner_display_name,
+               partner.avatar_url AS partner_avatar_url,
+               (
+                   SELECT GROUP_CONCAT(u2.username, ', ')
+                   FROM conversation_members cm2
+                   JOIN users u2 ON u2.user_id = cm2.user_id
+                   WHERE cm2.conversation_id = c.conversation_id AND cm2.user_id != ?
+               ) AS participant_names,
+               CASE
+                   WHEN last_msg.message_type = 'image' THEN '[Photo]'
+                   WHEN last_msg.message_type = 'post' THEN '[Shared post]'
+                   ELSE last_msg.body
+               END AS last_message_body,
+               last_msg.created_at AS last_message_at,
+               COALESCE(unread.unread_count, 0) AS unread_count
+        FROM conversation_members me
+        JOIN conversations c ON c.conversation_id = me.conversation_id
+        LEFT JOIN users partner ON partner.user_id = (
+            SELECT cm_partner.user_id
+            FROM conversation_members cm_partner
+            WHERE cm_partner.conversation_id = c.conversation_id AND cm_partner.user_id != me.user_id
+            ORDER BY cm_partner.user_id ASC
+            LIMIT 1
+        )
+        LEFT JOIN messages last_msg
+          ON last_msg.message_id = (
+              SELECT m.message_id
+              FROM messages m
+              WHERE m.conversation_id = c.conversation_id
+              ORDER BY m.created_at DESC, m.message_id DESC
+              LIMIT 1
+          )
+        LEFT JOIN (
+            SELECT m.conversation_id, COUNT(*) AS unread_count
+            FROM messages m
+            JOIN conversation_members cm
+              ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
+            WHERE m.sender_id != ? AND m.created_at > cm.last_read_at
+            GROUP BY m.conversation_id
+        ) unread ON unread.conversation_id = c.conversation_id
+        WHERE me.user_id = ?
+        ORDER BY COALESCE(last_msg.created_at, c.created_at) DESC, c.conversation_id DESC
+        """,
+        (viewer_id, viewer_id, viewer_id, viewer_id),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def fetch_message_contacts(conn: sqlite3.Connection, viewer_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT u.user_id, u.username, u.display_name
+        FROM follows f
+        JOIN users u
+          ON u.user_id = CASE
+              WHEN f.follower_id = ? THEN f.following_id
+              ELSE f.follower_id
+          END
+        WHERE f.follower_id = ? OR f.following_id = ?
+        ORDER BY u.username ASC
+        LIMIT 24
+        """,
+        (viewer_id, viewer_id, viewer_id),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def fetch_conversation_view(conn: sqlite3.Connection, viewer_id: int, conversation_id: int) -> dict[str, Any]:
+    membership = conn.execute(
+        "SELECT conversation_id FROM conversation_members WHERE conversation_id = ? AND user_id = ?",
+        (conversation_id, viewer_id),
+    ).fetchone()
+    if not membership:
+        raise AppError("Conversation not found.")
+    conversation = conn.execute(
+        "SELECT conversation_id, title, is_group FROM conversations WHERE conversation_id = ?",
+        (conversation_id,),
+    ).fetchone()
+    if not conversation:
+        raise AppError("Conversation not found.")
+    partner = conn.execute(
+        """
+        SELECT u.user_id, u.username, u.display_name, u.avatar_url
+        FROM conversation_members cm
+        JOIN users u ON u.user_id = cm.user_id
+        WHERE cm.conversation_id = ? AND cm.user_id != ?
+        LIMIT 1
+        """,
+        (conversation_id, viewer_id),
+    ).fetchone()
+    if not partner:
+        raise AppError("Conversation partner not found.")
+    participants = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT u.user_id, u.username, u.display_name
+            FROM conversation_members cm
+            JOIN users u ON u.user_id = cm.user_id
+            WHERE cm.conversation_id = ?
+            ORDER BY u.username ASC
+            """,
+            (conversation_id,),
+        )
+    ]
+    messages = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT m.message_id, m.sender_id, m.body, m.created_at, u.username,
+                   m.message_type, m.image_url, m.shared_post_id,
+                   sp.caption AS shared_post_caption,
+                   sp.image_url AS shared_post_image_url,
+                   spu.username AS shared_post_username
+            FROM messages m
+            JOIN users u ON u.user_id = m.sender_id
+            LEFT JOIN posts sp ON sp.post_id = m.shared_post_id
+            LEFT JOIN users spu ON spu.user_id = sp.user_id
+            WHERE m.conversation_id = ?
+            ORDER BY m.created_at ASC, m.message_id ASC
+            """,
+            (conversation_id,),
+        )
+    ]
+    reactions_map: dict[int, list[dict[str, Any]]] = {}
+    for row in conn.execute(
+        """
+        SELECT mr.message_id,
+               mr.reaction,
+               COUNT(*) AS reaction_count,
+               MAX(CASE WHEN mr.user_id = ? THEN 1 ELSE 0 END) AS reacted_by_viewer
+        FROM message_reactions mr
+        JOIN messages m ON m.message_id = mr.message_id
+        WHERE m.conversation_id = ?
+        GROUP BY mr.message_id, mr.reaction
+        ORDER BY mr.reaction ASC
+        """,
+        (viewer_id, conversation_id),
+    ):
+        reaction_row = dict(row)
+        reactions_map.setdefault(int(row["message_id"]), []).append(reaction_row)
+    for message in messages:
+        message["reactions"] = reactions_map.get(int(message["message_id"]), [])
+    return {
+        "conversation_id": conversation_id,
+        "partner": dict(partner),
+        "conversation": dict(conversation),
+        "participants": participants,
+        "messages": messages,
+    }
+
+
+def mark_conversation_read(conn: sqlite3.Connection, viewer_id: int, conversation_id: int) -> None:
+    timestamp = datetime.now().replace(microsecond=0).isoformat(sep=" ")
+    conn.execute(
+        """
+        UPDATE conversation_members
+        SET last_read_at = ?
+        WHERE conversation_id = ? AND user_id = ?
+        """,
+        (timestamp, conversation_id, viewer_id),
+    )
+    conn.commit()
 
 
 def fetch_feed(
@@ -361,6 +825,7 @@ def fetch_feed(
     search: str | None = None,
     liked_only: bool = False,
     bookmarked_only: bool = False,
+    following_only: bool = False,
 ) -> list[dict[str, Any]]:
     joins = [
         """
@@ -392,6 +857,11 @@ def fetch_feed(
         filters.append("viewer_likes.like_id IS NOT NULL")
     if bookmarked_only:
         filters.append("viewer_bookmarks.bookmark_id IS NOT NULL")
+    if following_only:
+        filters.append(
+            "EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = ? AND f.following_id = p.user_id)"
+        )
+        params.append(viewer_id)
 
     order_by = {
         "latest": "p.created_at DESC",
@@ -863,6 +1333,118 @@ def execute_safe_sql(conn: sqlite3.Connection, intent: SQLIntent, viewer_id: int
     return columns, data
 
 
+def fetch_related_posts_for_query(
+    conn: sqlite3.Connection,
+    viewer_id: int,
+    columns: list[str],
+    rows: list[tuple[Any, ...]],
+    *,
+    limit: int = 9,
+) -> list[dict[str, Any]]:
+    if not columns or not rows:
+        return []
+    display_limit = min(limit, len(rows))
+    if display_limit <= 0:
+        return []
+
+    lowered_columns = [column.lower() for column in columns]
+    post_id_indexes = [
+        index
+        for index, column in enumerate(lowered_columns)
+        if column == "post_id" or column.endswith(".post_id") or column.endswith("_post_id")
+    ]
+    username_indexes = [
+        index
+        for index, column in enumerate(lowered_columns)
+        if column == "username" or column.endswith(".username")
+    ]
+    tag_indexes = [
+        index
+        for index, column in enumerate(lowered_columns)
+        if column in {"tag", "tag_name"} or column.endswith(".tag")
+    ]
+
+    post_ids: list[int] = []
+    seen_post_ids: set[int] = set()
+    usernames: list[str] = []
+    seen_usernames: set[str] = set()
+    tags: list[str] = []
+    seen_tags: set[str] = set()
+
+    for row in rows:
+        for index in post_id_indexes:
+            value = row[index]
+            try:
+                post_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if post_id not in seen_post_ids:
+                seen_post_ids.add(post_id)
+                post_ids.append(post_id)
+        for index in username_indexes:
+            value = row[index]
+            if not isinstance(value, str):
+                continue
+            username = value.strip().lower().lstrip("@")
+            if username and username not in seen_usernames:
+                seen_usernames.add(username)
+                usernames.append(username)
+        for index in tag_indexes:
+            value = row[index]
+            if not isinstance(value, str):
+                continue
+            tag = value.strip().lower().lstrip("#")
+            if tag and tag not in seen_tags:
+                seen_tags.add(tag)
+                tags.append(tag)
+
+    if usernames:
+        placeholders = ",".join("?" for _ in usernames)
+        for row in conn.execute(
+            f"""
+            SELECT p.post_id
+            FROM posts p
+            JOIN users u ON u.user_id = p.user_id
+            WHERE u.username IN ({placeholders})
+            ORDER BY p.like_count DESC, p.comment_count DESC, p.created_at DESC
+            LIMIT 24
+            """,
+            usernames,
+        ):
+            post_id = int(row["post_id"])
+            if post_id not in seen_post_ids:
+                seen_post_ids.add(post_id)
+                post_ids.append(post_id)
+
+    if tags:
+        placeholders = ",".join("?" for _ in tags)
+        for row in conn.execute(
+            f"""
+            SELECT DISTINCT p.post_id
+            FROM posts p
+            JOIN post_tags pt ON pt.post_id = p.post_id
+            JOIN tags t ON t.tag_id = pt.tag_id
+            WHERE t.name IN ({placeholders})
+            ORDER BY p.like_count DESC, p.comment_count DESC, p.created_at DESC
+            LIMIT 24
+            """,
+            tags,
+        ):
+            post_id = int(row["post_id"])
+            if post_id not in seen_post_ids:
+                seen_post_ids.add(post_id)
+                post_ids.append(post_id)
+
+    if not post_ids:
+        return []
+
+    ranking = {post_id: index for index, post_id in enumerate(post_ids)}
+    feed_posts = fetch_feed(conn, viewer_id, sort_by="popular")
+    related_posts = [post for post in feed_posts if post["post_id"] in ranking]
+    related_posts.sort(key=lambda post: ranking[post["post_id"]])
+    return related_posts[:display_limit]
+
+
 def render_flash(message: str | None, level: str = "info") -> str:
     if not message:
         return ""
@@ -876,7 +1458,7 @@ def render_auth_page(title: str, form_body: str, alt_link: str, flash: str | Non
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{escape(title)} | HKUgram</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260415f">
+    <link rel="stylesheet" href="/static/style.css?v=20260415m">
 </head>
 <body data-theme="light">
     <main class="auth-shell">
@@ -962,11 +1544,14 @@ def render_post_card(post: dict[str, Any], viewer_id: int) -> str:
             {excerpt_html}
         </div>
         <div class="post-card-footer">
-            <a href="{url_with_viewer('/', viewer_id, author=post['username'])}" class="post-user-stamp">
+            <a href="{url_with_viewer('/history', viewer_id, user_id=post['user_id'])}" class="post-user-stamp">
                 <img src="{escape(post['avatar_url'])}" alt="avatar" class="avatar tiny">
                 <span>@{escape(post['username'])}</span>
             </a>
-            <span class="post-like-chip">{like_icon} {post['like_count']}</span>
+            <div class="pill-row">
+                <a class="text-button" href="{url_with_viewer('/messages', viewer_id, share_post_id=post['post_id'])}">Share</a>
+                <span class="post-like-chip">{like_icon} {post['like_count']}</span>
+            </div>
         </div>
     </article>
     """
@@ -974,13 +1559,14 @@ def render_post_card(post: dict[str, Any], viewer_id: int) -> str:
 
 def html_page(title: str, viewer_id: int, body: str, conn: sqlite3.Connection, active_nav: str = "discover") -> bytes:
     profile = fetch_profile_summary(conn, viewer_id)
+    unread_notifications = unread_notification_count(conn, viewer_id)
     page = f"""<!doctype html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{escape(title)} | HKUgram</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260415f">
+    <link rel="stylesheet" href="/static/style.css?v=20260415m">
 </head>
 <body data-page="{escape(active_nav)}" data-theme="light">
     <div class="app-shell">
@@ -1024,9 +1610,11 @@ def html_page(title: str, viewer_id: int, body: str, conn: sqlite3.Connection, a
     <nav class="bottom-nav">
         <a data-nav="discover" href="{url_with_viewer('/', viewer_id)}">Home</a>
         <a data-nav="history" href="{url_with_viewer('/history', viewer_id)}">Profile</a>
+        <a data-nav="messages" href="{url_with_viewer('/messages', viewer_id)}">Chats</a>
         <a class="bottom-compose" data-nav="create" href="{url_with_viewer('/create', viewer_id)}" aria-label="Create post">+</a>
         <a data-nav="analytics" href="{url_with_viewer('/analytics', viewer_id)}">Insights</a>
         <a data-nav="ask" href="{url_with_viewer('/query', viewer_id)}">Ask</a>
+        <a data-nav="notifications" href="{url_with_viewer('/notifications', viewer_id)}">Alerts{" (" + str(unread_notifications) + ")" if unread_notifications else ""}</a>
     </nav>
     <script src="/static/app.js?v=20260415f"></script>
 </body>
@@ -1042,6 +1630,7 @@ def render_feed_page(conn: sqlite3.Connection, params: dict[str, list[str]]) -> 
     search = params.get("search", [""])[0] or None
     liked_only = params.get("liked", ["0"])[0] == "1"
     bookmarked_only = params.get("bookmarked", ["0"])[0] == "1"
+    following_only = params.get("following", ["0"])[0] == "1"
     flash = params.get("flash", [""])[0] or None
     feed = fetch_feed(
         conn,
@@ -1052,6 +1641,7 @@ def render_feed_page(conn: sqlite3.Connection, params: dict[str, list[str]]) -> 
         search=search,
         liked_only=liked_only,
         bookmarked_only=bookmarked_only,
+        following_only=following_only,
     )
     posts_html = "".join(render_post_card(post, viewer_id) for post in feed)
     if not posts_html:
@@ -1062,8 +1652,19 @@ def render_feed_page(conn: sqlite3.Connection, params: dict[str, list[str]]) -> 
         </section>
         """
     sort_links = "".join(
-        f"<a class='filter-pill {'active' if sort_by == key else ''}' href='{url_with_viewer('/', viewer_id, sort=key, tag=tag, author=author, search=search, liked='1' if liked_only else None, bookmarked='1' if bookmarked_only else None)}'>{label}</a>"
+        f"<a class='filter-pill {'active' if sort_by == key else ''}' href='{url_with_viewer('/', viewer_id, sort=key, tag=tag, author=author, search=search, liked='1' if liked_only else None, bookmarked='1' if bookmarked_only else None, following='1' if following_only else None)}'>{label}</a>"
         for key, label in [("latest", "Latest"), ("popular", "Hot"), ("trending", "Trending")]
+    )
+    following_filter_link = url_with_viewer(
+        "/",
+        viewer_id,
+        sort=sort_by,
+        tag=tag,
+        author=author,
+        search=search,
+        liked="1" if liked_only else None,
+        bookmarked="1" if bookmarked_only else None,
+        following=None if following_only else "1",
     )
     body = f"""
     <section class="section-header">
@@ -1071,7 +1672,7 @@ def render_feed_page(conn: sqlite3.Connection, params: dict[str, list[str]]) -> 
             <h2>Discover</h2>
             <p class="lead">A clean waterfall of posts. Open any card for details.</p>
         </div>
-        <div class="pill-row">{sort_links}</div>
+        <div class="pill-row">{sort_links}<a class="filter-pill {'active' if following_only else ''}" href="{following_filter_link}">Following</a></div>
     </section>
     {render_flash(flash)}
     <section class="feed-grid">{posts_html}</section>
@@ -1175,7 +1776,7 @@ def render_post_detail_page(conn: sqlite3.Connection, params: dict[str, list[str
         {media_html}
         <article class="detail-content-card">
             <div class="detail-user-row">
-                <a href="{url_with_viewer('/', viewer_id, author=post['username'])}" class="post-user-stamp">
+                <a href="{url_with_viewer('/history', viewer_id, user_id=post['user_id'])}" class="post-user-stamp">
                     <img src="{escape(post['avatar_url'])}" alt="avatar" class="avatar tiny">
                     <span>@{escape(post['username'])}</span>
                 </a>
@@ -1202,6 +1803,7 @@ def render_post_detail_page(conn: sqlite3.Connection, params: dict[str, list[str
                     <input type="hidden" name="return_to" value="{escape(return_to)}">
                     <button class="action-button" type="submit">{'Saved' if post['bookmarked_by_viewer'] else 'Save'}</button>
                 </form>
+                <a class="action-button" href="{url_with_viewer('/messages', viewer_id, share_post_id=post['post_id'])}">Share</a>
                 {owner_actions}
             </div>
             <section class="comment-box">
@@ -1223,8 +1825,36 @@ def render_post_detail_page(conn: sqlite3.Connection, params: dict[str, list[str
 
 def render_history_page(conn: sqlite3.Connection, params: dict[str, list[str]]) -> bytes:
     viewer_id = current_user_id(params)
-    profile = fetch_profile_summary(conn, viewer_id)
+    requested_user_id = params.get("user_id", [""])[0].strip()
+    profile_user_id = viewer_id
+    if requested_user_id:
+        try:
+            profile_user_id = int(requested_user_id)
+        except ValueError as exc:
+            raise AppError("Invalid profile user.") from exc
+    profile = fetch_profile_summary(conn, profile_user_id)
     posts = fetch_feed(conn, viewer_id, author=profile["username"], sort_by="latest")
+    follow_state = fetch_follow_state(conn, viewer_id, profile_user_id)
+    profile_action_html = ""
+    if not follow_state["is_self"]:
+        return_to = url_with_viewer("/history", viewer_id, user_id=profile_user_id)
+        profile_action_html = f"""
+        <form method="post" action="/toggle-follow">
+            <input type="hidden" name="viewer" value="{viewer_id}">
+            <input type="hidden" name="target_user_id" value="{profile_user_id}">
+            <input type="hidden" name="return_to" value="{escape(return_to)}">
+            <button class="action-button {'primary' if not follow_state['is_following'] else ''}" type="submit">{'Follow' if not follow_state['is_following'] else 'Unfollow'}</button>
+        </form>
+        <a class="action-button" href="{url_with_viewer('/messages', viewer_id, user_id=profile_user_id)}">Message</a>
+        """
+    followers_html = "".join(
+        f"<a class='filter-pill' href='{url_with_viewer('/history', viewer_id, user_id=user['user_id'])}'>@{escape(user['username'])}</a>"
+        for user in follow_state["followers"]
+    ) or "<p class='muted'>No followers yet.</p>"
+    following_html = "".join(
+        f"<a class='filter-pill' href='{url_with_viewer('/history', viewer_id, user_id=user['user_id'])}'>@{escape(user['username'])}</a>"
+        for user in follow_state["following"]
+    ) or "<p class='muted'>Not following anyone yet.</p>"
     body = f"""
     <section class="profile-hero">
         <div class="profile-hero-main">
@@ -1234,24 +1864,313 @@ def render_history_page(conn: sqlite3.Connection, params: dict[str, list[str]]) 
                 <h2>{escape(profile['display_name'])}</h2>
                 <p class="profile-handle">@{escape(profile['username'])}</p>
                 <p class="lead">{escape(profile['bio'])}</p>
+                <div class="pill-row">{profile_action_html}</div>
             </div>
         </div>
         <div class="profile-summary-row">
             <div><strong>{profile['post_total']}</strong><span>Posts</span></div>
             <div><strong>{profile['like_total']}</strong><span>Total Likes</span></div>
             <div><strong>{profile['comment_total']}</strong><span>Comments</span></div>
+            <div><strong>{profile['follower_total']}</strong><span>Followers</span></div>
+            <div><strong>{profile['following_total']}</strong><span>Following</span></div>
         </div>
+    </section>
+    <section class="query-grid">
+        <article class="dashboard-card">
+            <h3>Followers</h3>
+            <div class="pill-row">{followers_html}</div>
+        </article>
+        <article class="dashboard-card">
+            <h3>Following</h3>
+            <div class="pill-row">{following_html}</div>
+        </article>
     </section>
     <section class="section-panel">
         <p class="eyebrow">Personal Archive</p>
         <h2>@{escape(profile['username'])} post archive</h2>
-        <p class="lead">This page reads like a creator board instead of a raw history list, while still satisfying the user-specific post history requirement.</p>
     </section>
     <section class="feed-grid">
         {''.join(render_post_card(post, viewer_id) for post in posts) or '<p class="muted">No posts yet.</p>'}
     </section>
     """
     return html_page("My Posts", viewer_id, body, conn, active_nav="history")
+
+
+def render_messages_page(conn: sqlite3.Connection, params: dict[str, list[str]]) -> bytes:
+    viewer_id = current_user_id(params)
+    flash = params.get("flash", [""])[0] or None
+    conversation_id_raw = params.get("conversation_id", [""])[0].strip()
+    partner_user_id_raw = params.get("user_id", [""])[0].strip()
+    share_post_id_raw = params.get("share_post_id", [""])[0].strip()
+
+    selected_conversation_id: int | None = None
+    share_post: dict[str, Any] | None = None
+    if share_post_id_raw:
+        try:
+            share_post_id = int(share_post_id_raw)
+        except ValueError as exc:
+            raise AppError("Invalid post to share.") from exc
+        post_row = conn.execute(
+            """
+            SELECT p.post_id, p.caption, p.image_url, u.username
+            FROM posts p
+            JOIN users u ON u.user_id = p.user_id
+            WHERE p.post_id = ?
+            """,
+            (share_post_id,),
+        ).fetchone()
+        if not post_row:
+            raise AppError("Post not found for sharing.")
+        share_post = dict(post_row)
+    if partner_user_id_raw:
+        try:
+            partner_user_id = int(partner_user_id_raw)
+        except ValueError as exc:
+            raise AppError("Invalid user for chat.") from exc
+        partner = conn.execute("SELECT user_id FROM users WHERE user_id = ?", (partner_user_id,)).fetchone()
+        if not partner:
+            raise AppError("The selected user does not exist.")
+        selected_conversation_id = get_or_create_direct_conversation(conn, viewer_id, partner_user_id)
+    elif conversation_id_raw:
+        try:
+            selected_conversation_id = int(conversation_id_raw)
+        except ValueError as exc:
+            raise AppError("Invalid conversation.") from exc
+
+    if selected_conversation_id is not None:
+        mark_conversation_read(conn, viewer_id, selected_conversation_id)
+
+    threads = fetch_message_threads(conn, viewer_id)
+    if selected_conversation_id is None and threads:
+        selected_conversation_id = int(threads[0]["conversation_id"])
+        mark_conversation_read(conn, viewer_id, selected_conversation_id)
+        threads = fetch_message_threads(conn, viewer_id)
+
+    conversation_view: dict[str, Any] | None = None
+    if selected_conversation_id is not None:
+        conversation_view = fetch_conversation_view(conn, viewer_id, selected_conversation_id)
+
+    thread_items_html = "".join(
+        f"""
+        <a class="thread-item {'active-thread' if selected_conversation_id == thread['conversation_id'] else ''}"
+           href="{url_with_viewer('/messages', viewer_id, conversation_id=thread['conversation_id'], share_post_id=share_post['post_id'] if share_post else None)}">
+            <img src="{escape(thread['partner_avatar_url'] or 'https://picsum.photos/seed/group-chat/80/80')}" alt="avatar" class="avatar small">
+            <div class="thread-meta">
+                <strong>{escape((thread['title'] or thread['participant_names'] or 'Group chat') if thread['is_group'] else '@' + (thread['partner_username'] or 'unknown'))}</strong>
+                <span class="muted">{escape((thread['last_message_body'] or 'No messages yet')[:55])}</span>
+            </div>
+            {"<span class='thread-unread'>" + str(thread['unread_count']) + "</span>" if thread['unread_count'] else ""}
+        </a>
+        """
+        for thread in threads
+    ) or "<p class='muted'>No conversations yet.</p>"
+
+    contacts = fetch_message_contacts(conn, viewer_id)
+    start_chat_html = "".join(
+        f"<a class='filter-pill' href='{url_with_viewer('/messages', viewer_id, user_id=contact['user_id'], share_post_id=share_post['post_id'] if share_post else None)}'>@{escape(contact['username'])}</a>"
+        for contact in contacts
+    ) or "<p class='muted'>Follow people to start chatting.</p>"
+    group_member_options = "".join(
+        f"<label class='toggle-label'><input type='checkbox' name='member_ids' value='{contact['user_id']}'> @{escape(contact['username'])}</label>"
+        for contact in contacts
+    ) or "<p class='muted'>No available users for group creation yet.</p>"
+
+    chat_panel_html = """
+    <article class="dashboard-card">
+        <h3>Chat</h3>
+        <p class="muted">Select a conversation from the inbox to start messaging.</p>
+    </article>
+    """
+    if conversation_view is not None:
+        partner = conversation_view["partner"]
+        conversation_meta = conversation_view["conversation"]
+        chat_title = (
+            conversation_meta["title"].strip()
+            if int(conversation_meta["is_group"])
+            else f"@{partner['username']}"
+        )
+        participants_line = ", ".join(
+            f"@{participant['username']}"
+            for participant in conversation_view["participants"]
+        )
+        reaction_options = ["❤️", "👍", "😂", "🔥"]
+        message_rows: list[str] = []
+        for message in conversation_view["messages"]:
+            message_is_mine = int(message["sender_id"]) == viewer_id
+            shared_post_html = ""
+            if message.get("shared_post_id"):
+                shared_caption = message.get("shared_post_caption") or "Shared post"
+                shared_image_html = (
+                    f"<img src='{escape(message['shared_post_image_url'])}' alt='shared post' class='shared-post-image'>"
+                    if message.get("shared_post_image_url")
+                    else ""
+                )
+                shared_post_html = f"""
+                <a class="shared-post-card" href="{url_with_viewer('/post', viewer_id, post_id=message['shared_post_id'])}">
+                    {shared_image_html}
+                    <div class="shared-post-copy">
+                        <strong>@{escape(message.get('shared_post_username') or '')}</strong>
+                        <span>{escape(shared_caption[:90])}</span>
+                    </div>
+                </a>
+                """
+            image_html = (
+                f"<img src='{escape(message['image_url'])}' alt='chat image' class='chat-inline-image'>"
+                if message.get("image_url")
+                else ""
+            )
+            reaction_summary_html = "".join(
+                f"<span class='reaction-pill {'active' if reaction.get('reacted_by_viewer') else ''}'>{escape(reaction['reaction'])} {reaction['reaction_count']}</span>"
+                for reaction in message.get("reactions", [])
+            )
+            reaction_controls_html = ""
+            recall_button_html = ""
+            return_to = url_with_viewer("/messages", viewer_id, conversation_id=conversation_view["conversation_id"])
+            if message_is_mine:
+                recall_button_html = f"""
+                <form method="post" action="/messages/recall" class="inline-message-action">
+                    <input type="hidden" name="viewer" value="{viewer_id}">
+                    <input type="hidden" name="message_id" value="{message['message_id']}">
+                    <input type="hidden" name="return_to" value="{escape(return_to)}">
+                    <button class="text-button danger" type="submit">Recall</button>
+                </form>
+                """
+            else:
+                reaction_controls_html = "".join(
+                    f"""
+                    <form method="post" action="/messages/react" class="inline-message-action">
+                        <input type="hidden" name="viewer" value="{viewer_id}">
+                        <input type="hidden" name="message_id" value="{message['message_id']}">
+                        <input type="hidden" name="reaction" value="{escape(emoji)}">
+                        <input type="hidden" name="return_to" value="{escape(return_to)}">
+                        <button class="reaction-picker" type="submit">{escape(emoji)}</button>
+                    </form>
+                    """
+                    for emoji in reaction_options
+                )
+            message_rows.append(
+                f"""
+                <div class="chat-row {'mine' if message_is_mine else 'theirs'}">
+                    <div class="chat-bubble">
+                        {shared_post_html}
+                        {image_html}
+                        {f"<p>{escape(message['body'])}</p>" if message.get('body') else ""}
+                        <small>{escape(relative_time(message['created_at']))}</small>
+                        <div class="chat-meta-row">
+                            <div class="reaction-summary">{reaction_summary_html}</div>
+                            {recall_button_html}
+                        </div>
+                        <div class="reaction-controls">{reaction_controls_html}</div>
+                    </div>
+                </div>
+                """
+            )
+        message_rows_html = "".join(message_rows) or "<p class='muted'>No messages yet. Say hi.</p>"
+        chat_panel_html = f"""
+        <article class="dashboard-card chat-panel">
+            <div class="chat-header">
+                <div class="thread-meta">
+                    <strong>{escape(chat_title)}</strong>
+                    <span class="muted">{escape(participants_line)}</span>
+                </div>
+            </div>
+            <div class="chat-body">
+                {message_rows_html}
+            </div>
+            <form method="post" action="/messages/send" class="chat-composer">
+                <input type="hidden" name="viewer" value="{viewer_id}">
+                <input type="hidden" name="conversation_id" value="{conversation_view['conversation_id']}">
+                <input type="hidden" name="return_to" value="{escape(url_with_viewer('/messages', viewer_id, conversation_id=conversation_view['conversation_id'], share_post_id=share_post['post_id'] if share_post else None))}">
+                <input type="text" name="body" maxlength="1000" placeholder="Message...">
+                <input type="url" name="image_url" placeholder="Image URL (optional)">
+                <input type="hidden" name="shared_post_id" value="{share_post['post_id'] if share_post else ''}">
+                <button class="action-button primary" type="submit">Send</button>
+            </form>
+            {"<p class='muted'>Sharing post #" + str(share_post['post_id']) + " in this chat. <a href='" + url_with_viewer('/messages', viewer_id, conversation_id=conversation_view['conversation_id']) + "'>Cancel</a></p>" if share_post else ""}
+        </article>
+        """
+    body = f"""
+    <section class="section-panel">
+        <p class="eyebrow">Messages</p>
+        <h2>Inbox</h2>
+        {render_flash(flash)}
+    </section>
+    <section class="messages-shell">
+        <aside class="dashboard-card inbox-panel">
+            <h3>Chats</h3>
+            <div class="thread-list">{thread_items_html}</div>
+            <h3>Start a chat</h3>
+            <div class="pill-row">{start_chat_html}</div>
+            <h3>Create group</h3>
+            <form method="post" action="/messages/create-group" class="dashboard-card">
+                <input type="hidden" name="viewer" value="{viewer_id}">
+                <input type="hidden" name="return_to" value="{escape(url_with_viewer('/messages', viewer_id, share_post_id=share_post['post_id'] if share_post else None))}">
+                <input type="text" name="title" placeholder="Group name (optional)">
+                <div class="thread-list">{group_member_options}</div>
+                <button class="action-button" type="submit">Create Group</button>
+            </form>
+        </aside>
+        {chat_panel_html}
+    </section>
+    """
+    return html_page("Messages", viewer_id, body, conn, active_nav="messages")
+
+
+def render_notifications_page(conn: sqlite3.Connection, params: dict[str, list[str]]) -> bytes:
+    viewer_id = current_user_id(params)
+    flash = params.get("flash", [""])[0] or None
+    notifications = fetch_notifications(conn, viewer_id)
+    rows_html: list[str] = []
+    for item in notifications:
+        target_url = url_with_viewer("/notifications", viewer_id)
+        if item["target_type"] == "post":
+            target_url = url_with_viewer("/post", viewer_id, post_id=item["target_id"])
+        elif item["target_type"] == "user":
+            target_url = url_with_viewer("/history", viewer_id, user_id=item["target_id"])
+        elif item["target_type"] == "message" and item.get("message_conversation_id"):
+            target_url = url_with_viewer("/messages", viewer_id, conversation_id=item["message_conversation_id"])
+        mark_form = ""
+        if not item["is_read"]:
+            mark_form = f"""
+            <form method="post" action="/notifications/read" class="inline-message-action">
+                <input type="hidden" name="viewer" value="{viewer_id}">
+                <input type="hidden" name="notification_id" value="{item['notification_id']}">
+                <input type="hidden" name="return_to" value="{escape(url_with_viewer('/notifications', viewer_id))}">
+                <button class="text-button" type="submit">Mark read</button>
+            </form>
+            """
+        rows_html.append(
+            f"""
+            <article class="notification-item {'unread-item' if not item['is_read'] else ''}">
+                <a class="notification-link" href="{target_url}">
+                    <img src="{escape(item['actor_avatar_url'])}" alt="avatar" class="avatar tiny">
+                    <div class="notification-copy">
+                        <strong>@{escape(item['actor_username'])}</strong>
+                        <span>{escape(item['preview_text'])}</span>
+                        <small class="muted">{escape(relative_time(item['created_at']))}</small>
+                    </div>
+                </a>
+                {mark_form}
+            </article>
+            """
+        )
+    list_html = "".join(rows_html) or "<p class='muted'>No notifications yet.</p>"
+    body = f"""
+    <section class="section-panel">
+        <p class="eyebrow">Notification Center</p>
+        <h2>Activity</h2>
+        {render_flash(flash)}
+        <form method="post" action="/notifications/read-all" class="inline-message-action">
+            <input type="hidden" name="viewer" value="{viewer_id}">
+            <input type="hidden" name="return_to" value="{escape(url_with_viewer('/notifications', viewer_id))}">
+            <button class="action-button" type="submit">Mark all read</button>
+        </form>
+    </section>
+    <section class="dashboard-card notifications-list">
+        {list_html}
+    </section>
+    """
+    return html_page("Notifications", viewer_id, body, conn, active_nav="notifications")
 
 
 def render_analytics_page(conn: sqlite3.Connection, params: dict[str, list[str]]) -> bytes:
@@ -1320,16 +2239,15 @@ def render_query_page(conn: sqlite3.Connection, params: dict[str, list[str]]) ->
             columns, rows = execute_safe_sql(conn, intent, viewer_id=viewer_id)
         except AppError as exc:
             error = str(exc)
-    table_html = ""
+    related_posts_html = ""
     if columns:
-        header = "".join(f"<th>{escape(col)}</th>" for col in columns)
-        body_rows = "".join(
-            f"<tr>{''.join(f'<td>{escape(str(value))}</td>' for value in row)}</tr>"
-            for row in rows
-        )
-        table_html = f"<table><thead><tr>{header}</tr></thead><tbody>{body_rows}</tbody></table>"
+        related_posts = fetch_related_posts_for_query(conn, viewer_id, columns, rows)
+        if related_posts:
+            related_posts_html = f"<div class='feed-grid'>{''.join(render_post_card(post, viewer_id) for post in related_posts)}</div>"
+        else:
+            related_posts_html = "<p class='muted'>The query ran successfully, but there were no related posts to show.</p>"
     elif question and not error:
-        table_html = "<p class='muted'>The query ran successfully but returned no rows.</p>"
+        related_posts_html = "<p class='muted'>The query ran successfully but returned no rows.</p>"
     prompt_links = "".join(
         f"<a class='filter-pill' href='{url_with_viewer('/query', viewer_id, question=prompt)}'>{escape(prompt)}</a>"
         for prompt in [
@@ -1344,8 +2262,7 @@ def render_query_page(conn: sqlite3.Connection, params: dict[str, list[str]]) ->
     body = f"""
     <section class="section-panel">
         <p class="eyebrow">Ask HKUgram</p>
-        <h2>Type a question in natural language and get database-backed results.</h2>
-        <p class="lead">Users do not need to see SQL. The app interprets the request behind the scenes, queries the database safely, and only returns readable results.</p>
+        <h2>Ask in natural language and see related posts.</h2>
         <p class="muted">{escape(model_mode)}</p>
         {render_flash(flash)}
         {render_flash(error, 'error')}
@@ -1373,8 +2290,8 @@ def render_query_page(conn: sqlite3.Connection, params: dict[str, list[str]]) ->
         </article>
     </section>
     <section class="dashboard-card">
-        <h3>Result Set</h3>
-        {table_html}
+        <h3>Related Posts</h3>
+        {related_posts_html}
     </section>
     """
     return html_page("Ask HKUgram", viewer_id, body, conn, active_nav="ask")
@@ -1446,6 +2363,12 @@ class HKUgramHandler(SimpleHTTPRequestHandler):
                 if parsed.path == "/history":
                     params["viewer"] = [str(viewer_id)]
                     return self.respond_bytes(render_history_page(conn, params))
+                if parsed.path == "/messages":
+                    params["viewer"] = [str(viewer_id)]
+                    return self.respond_bytes(render_messages_page(conn, params))
+                if parsed.path == "/notifications":
+                    params["viewer"] = [str(viewer_id)]
+                    return self.respond_bytes(render_notifications_page(conn, params))
         except AppError as exc:
             return self.respond_error(str(exc))
         self.send_error(HTTPStatus.NOT_FOUND, "Page not found")
@@ -1454,7 +2377,8 @@ class HKUgramHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         length = int(self.headers.get("Content-Length", "0"))
         payload = self.rfile.read(length).decode("utf-8")
-        form = {key: values[0] for key, values in parse_qs(payload).items()}
+        parsed_form = parse_qs(payload)
+        form = {key: values[0] for key, values in parsed_form.items()}
         if parsed.path == "/login":
             return self.handle_login(form)
         if parsed.path == "/register":
@@ -1472,6 +2396,39 @@ class HKUgramHandler(SimpleHTTPRequestHandler):
                     return
                 if parsed.path == "/toggle-bookmark":
                     self.handle_toggle_bookmark(conn, viewer_id, int(form["post_id"]))
+                    return
+                if parsed.path == "/toggle-follow":
+                    self.handle_toggle_follow(conn, viewer_id, int(form["target_user_id"]))
+                    return
+                if parsed.path == "/messages/send":
+                    self.handle_send_message(
+                        conn,
+                        viewer_id,
+                        int(form["conversation_id"]),
+                        form.get("body", ""),
+                        form.get("image_url", ""),
+                        form.get("shared_post_id", ""),
+                    )
+                    return
+                if parsed.path == "/messages/create-group":
+                    self.handle_create_group(
+                        conn,
+                        viewer_id,
+                        form.get("title", ""),
+                        parsed_form.get("member_ids", []),
+                    )
+                    return
+                if parsed.path == "/messages/react":
+                    self.handle_react_message(conn, viewer_id, int(form["message_id"]), form.get("reaction", ""))
+                    return
+                if parsed.path == "/messages/recall":
+                    self.handle_recall_message(conn, viewer_id, int(form["message_id"]))
+                    return
+                if parsed.path == "/notifications/read":
+                    self.handle_mark_notification_read(conn, viewer_id, int(form["notification_id"]))
+                    return
+                if parsed.path == "/notifications/read-all":
+                    self.handle_mark_all_notifications_read(conn, viewer_id)
                     return
                 if parsed.path == "/comments":
                     self.handle_create_comment(conn, viewer_id, int(form["post_id"]), form.get("body", ""))
@@ -1550,16 +2507,29 @@ class HKUgramHandler(SimpleHTTPRequestHandler):
         self.respond_redirect("/", cookie_header=cookie_header)
 
     def handle_toggle_like(self, conn: sqlite3.Connection, viewer_id: int, post_id: int) -> None:
+        post = conn.execute(
+            "SELECT post_id, user_id, caption FROM posts WHERE post_id = ?",
+            (post_id,),
+        ).fetchone()
+        if not post:
+            raise AppError("Post not found.")
         existing = conn.execute(
             "SELECT like_id FROM likes WHERE user_id = ? AND post_id = ?",
             (viewer_id, post_id),
         ).fetchone()
         if existing:
             conn.execute("DELETE FROM likes WHERE like_id = ?", (existing["like_id"],))
-            flash = "Post unliked."
         else:
             conn.execute("INSERT INTO likes (user_id, post_id) VALUES (?, ?)", (viewer_id, post_id))
-            flash = "Post liked."
+            create_notification(
+                conn,
+                recipient_id=int(post["user_id"]),
+                actor_id=viewer_id,
+                event_type="like",
+                target_type="post",
+                target_id=int(post["post_id"]),
+                preview_text=f"liked your post: {post['caption'][:80]}",
+            )
         conn.commit()
         target = self.headers.get("Referer") or url_with_viewer("/", viewer_id)
         self.respond_redirect(target)
@@ -1579,17 +2549,230 @@ class HKUgramHandler(SimpleHTTPRequestHandler):
         target = self.headers.get("Referer") or url_with_viewer("/", viewer_id)
         self.respond_redirect(target)
 
+    def handle_toggle_follow(self, conn: sqlite3.Connection, viewer_id: int, target_user_id: int) -> None:
+        if target_user_id == viewer_id:
+            raise AppError("You cannot follow yourself.")
+        target_user = conn.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (target_user_id,),
+        ).fetchone()
+        if not target_user:
+            raise AppError("The selected user does not exist.")
+        existing = conn.execute(
+            "SELECT follow_id FROM follows WHERE follower_id = ? AND following_id = ?",
+            (viewer_id, target_user_id),
+        ).fetchone()
+        if existing:
+            conn.execute("DELETE FROM follows WHERE follow_id = ?", (existing["follow_id"],))
+        else:
+            conn.execute(
+                "INSERT INTO follows (follower_id, following_id) VALUES (?, ?)",
+                (viewer_id, target_user_id),
+            )
+            create_notification(
+                conn,
+                recipient_id=target_user_id,
+                actor_id=viewer_id,
+                event_type="follow",
+                target_type="user",
+                target_id=viewer_id,
+                preview_text="started following you",
+            )
+        conn.commit()
+        target = self.headers.get("Referer") or url_with_viewer("/history", viewer_id, user_id=target_user_id)
+        self.respond_redirect(target)
+
+    def handle_send_message(
+        self,
+        conn: sqlite3.Connection,
+        viewer_id: int,
+        conversation_id: int,
+        body: str,
+        image_url: str = "",
+        shared_post_id: str = "",
+    ) -> None:
+        cleaned = body.strip()
+        cleaned_image_url = image_url.strip()
+        shared_post_id_value: int | None = None
+        if shared_post_id.strip():
+            try:
+                shared_post_id_value = int(shared_post_id.strip())
+            except ValueError as exc:
+                raise AppError("Invalid shared post.") from exc
+        if not cleaned and not cleaned_image_url and shared_post_id_value is None:
+            raise AppError("Send text, an image URL, or a shared post.")
+        membership = conn.execute(
+            "SELECT conversation_id FROM conversation_members WHERE conversation_id = ? AND user_id = ?",
+            (conversation_id, viewer_id),
+        ).fetchone()
+        if not membership:
+            raise AppError("You do not have access to this conversation.")
+        if shared_post_id_value is not None:
+            post = conn.execute("SELECT post_id FROM posts WHERE post_id = ?", (shared_post_id_value,)).fetchone()
+            if not post:
+                raise AppError("Shared post not found.")
+        message_type = "text"
+        if shared_post_id_value is not None:
+            message_type = "post"
+        elif cleaned_image_url:
+            message_type = "image"
+        created_at = datetime.now().replace(microsecond=0).isoformat(sep=" ")
+        conn.execute(
+            """
+            INSERT INTO messages (conversation_id, sender_id, body, message_type, image_url, shared_post_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                viewer_id,
+                cleaned,
+                message_type,
+                cleaned_image_url,
+                shared_post_id_value,
+                created_at,
+            ),
+        )
+        conn.commit()
+        target = self.headers.get("Referer") or url_with_viewer("/messages", viewer_id, conversation_id=conversation_id)
+        self.respond_redirect(target)
+
+    def handle_create_group(
+        self,
+        conn: sqlite3.Connection,
+        viewer_id: int,
+        title: str,
+        member_ids_raw: list[str],
+    ) -> None:
+        if not member_ids_raw:
+            raise AppError("Select at least two users to create a group.")
+        try:
+            member_ids = [int(member_id) for member_id in member_ids_raw]
+        except ValueError as exc:
+            raise AppError("Invalid group members.") from exc
+        conversation_id = create_group_conversation(conn, viewer_id, title, member_ids)
+        self.respond_redirect(url_with_viewer("/messages", viewer_id, conversation_id=conversation_id))
+
+    def handle_react_message(self, conn: sqlite3.Connection, viewer_id: int, message_id: int, reaction: str) -> None:
+        allowed_reactions = {"❤️", "👍", "😂", "🔥"}
+        cleaned_reaction = reaction.strip()
+        if cleaned_reaction not in allowed_reactions:
+            raise AppError("Unsupported reaction.")
+        message = conn.execute(
+            """
+            SELECT m.message_id, m.sender_id, m.conversation_id
+            FROM messages m
+            JOIN conversation_members cm
+              ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
+            WHERE m.message_id = ?
+            """,
+            (viewer_id, message_id),
+        ).fetchone()
+        if not message:
+            raise AppError("Message not found.")
+        if int(message["sender_id"]) == viewer_id:
+            raise AppError("You can only react to other users' messages.")
+        existing = conn.execute(
+            "SELECT reaction_id, reaction FROM message_reactions WHERE message_id = ? AND user_id = ?",
+            (message_id, viewer_id),
+        ).fetchone()
+        if existing and existing["reaction"] == cleaned_reaction:
+            conn.execute("DELETE FROM message_reactions WHERE reaction_id = ?", (existing["reaction_id"],))
+        elif existing:
+            conn.execute(
+                "UPDATE message_reactions SET reaction = ?, created_at = CURRENT_TIMESTAMP WHERE reaction_id = ?",
+                (cleaned_reaction, existing["reaction_id"]),
+            )
+            create_notification(
+                conn,
+                recipient_id=int(message["sender_id"]),
+                actor_id=viewer_id,
+                event_type="message_reaction",
+                target_type="message",
+                target_id=int(message["message_id"]),
+                preview_text=f"reacted to your message with {cleaned_reaction}",
+            )
+        else:
+            conn.execute(
+                "INSERT INTO message_reactions (message_id, user_id, reaction) VALUES (?, ?, ?)",
+                (message_id, viewer_id, cleaned_reaction),
+            )
+            create_notification(
+                conn,
+                recipient_id=int(message["sender_id"]),
+                actor_id=viewer_id,
+                event_type="message_reaction",
+                target_type="message",
+                target_id=int(message["message_id"]),
+                preview_text=f"reacted to your message with {cleaned_reaction}",
+            )
+        conn.commit()
+        target = self.headers.get("Referer") or url_with_viewer("/messages", viewer_id, conversation_id=message["conversation_id"])
+        self.respond_redirect(target)
+
+    def handle_recall_message(self, conn: sqlite3.Connection, viewer_id: int, message_id: int) -> None:
+        message = conn.execute(
+            """
+            SELECT m.message_id, m.sender_id, m.conversation_id
+            FROM messages m
+            JOIN conversation_members cm
+              ON cm.conversation_id = m.conversation_id AND cm.user_id = ?
+            WHERE m.message_id = ?
+            """,
+            (viewer_id, message_id),
+        ).fetchone()
+        if not message:
+            raise AppError("Message not found.")
+        if int(message["sender_id"]) != viewer_id:
+            raise AppError("You can only recall your own messages.")
+        conn.execute("DELETE FROM messages WHERE message_id = ?", (message_id,))
+        conn.commit()
+        target = self.headers.get("Referer") or url_with_viewer("/messages", viewer_id, conversation_id=message["conversation_id"])
+        self.respond_redirect(target)
+
     def handle_create_comment(self, conn: sqlite3.Connection, viewer_id: int, post_id: int, body: str) -> None:
         cleaned = body.strip()
         if not cleaned:
             raise AppError("Comment text cannot be empty.")
+        post = conn.execute(
+            "SELECT post_id, user_id, caption FROM posts WHERE post_id = ?",
+            (post_id,),
+        ).fetchone()
+        if not post:
+            raise AppError("Post not found.")
         created_at = datetime.now().replace(microsecond=0).isoformat(sep=" ")
         conn.execute(
             "INSERT INTO comments (user_id, post_id, body, created_at) VALUES (?, ?, ?, ?)",
             (viewer_id, post_id, cleaned, created_at),
         )
+        create_notification(
+            conn,
+            recipient_id=int(post["user_id"]),
+            actor_id=viewer_id,
+            event_type="comment",
+            target_type="post",
+            target_id=int(post["post_id"]),
+            preview_text=f"commented: {cleaned[:80]}",
+        )
         conn.commit()
         target = self.headers.get("Referer") or url_with_viewer("/", viewer_id)
+        self.respond_redirect(target)
+
+    def handle_mark_notification_read(self, conn: sqlite3.Connection, viewer_id: int, notification_id: int) -> None:
+        conn.execute(
+            "UPDATE notifications SET is_read = 1 WHERE notification_id = ? AND recipient_id = ?",
+            (notification_id, viewer_id),
+        )
+        conn.commit()
+        target = self.headers.get("Referer") or url_with_viewer("/notifications", viewer_id)
+        self.respond_redirect(target)
+
+    def handle_mark_all_notifications_read(self, conn: sqlite3.Connection, viewer_id: int) -> None:
+        conn.execute(
+            "UPDATE notifications SET is_read = 1 WHERE recipient_id = ? AND is_read = 0",
+            (viewer_id,),
+        )
+        conn.commit()
+        target = self.headers.get("Referer") or url_with_viewer("/notifications", viewer_id)
         self.respond_redirect(target)
 
     def handle_delete_comment(self, conn: sqlite3.Connection, viewer_id: int, comment_id: int) -> None:
