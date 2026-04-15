@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: hkugram
+    runtime: python
+    plan: free
+    startCommand: python app.py
+    healthCheckPath: /login
