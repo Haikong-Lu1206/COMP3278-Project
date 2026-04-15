@@ -642,6 +642,55 @@ def create_group_conversation(
     return conversation_id
 
 
+def add_user_to_group_conversation(
+    conn: sqlite3.Connection,
+    viewer_id: int,
+    conversation_id: int,
+    username: str,
+) -> tuple[int, str]:
+    cleaned_username = username.strip().lower().lstrip("@")
+    if not cleaned_username:
+        raise AppError("Enter a username to add.")
+    conversation = conn.execute(
+        """
+        SELECT conversation_id, is_group
+        FROM conversations
+        WHERE conversation_id = ?
+        """,
+        (conversation_id,),
+    ).fetchone()
+    if not conversation:
+        raise AppError("Conversation not found.")
+    if int(conversation["is_group"]) != 1:
+        raise AppError("You can only add members to group chats.")
+    viewer_membership = conn.execute(
+        "SELECT conversation_id FROM conversation_members WHERE conversation_id = ? AND user_id = ?",
+        (conversation_id, viewer_id),
+    ).fetchone()
+    if not viewer_membership:
+        raise AppError("You do not have access to this group.")
+    user_row = conn.execute(
+        "SELECT user_id, username FROM users WHERE username = ?",
+        (cleaned_username,),
+    ).fetchone()
+    if not user_row:
+        raise AppError("That username does not exist.")
+    member_id = int(user_row["user_id"])
+    already_member = conn.execute(
+        "SELECT conversation_id FROM conversation_members WHERE conversation_id = ? AND user_id = ?",
+        (conversation_id, member_id),
+    ).fetchone()
+    if already_member:
+        raise AppError("That user is already in the group.")
+    now = datetime.now().replace(microsecond=0).isoformat(sep=" ")
+    conn.execute(
+        "INSERT INTO conversation_members (conversation_id, user_id, last_read_at) VALUES (?, ?, ?)",
+        (conversation_id, member_id, now),
+    )
+    conn.commit()
+    return member_id, str(user_row["username"])
+
+
 def fetch_message_threads(conn: sqlite3.Connection, viewer_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
@@ -1458,13 +1507,17 @@ def render_auth_page(title: str, form_body: str, alt_link: str, flash: str | Non
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{escape(title)} | HKUgram</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260415m">
+    <link rel="stylesheet" href="/static/style.css?v=20260415ui6">
 </head>
 <body data-theme="light">
     <main class="auth-shell">
         <section class="auth-card auth-card-clean">
             <div class="brand-block auth-brand">
-                <div class="brand-mark">H</div>
+                <div class="brand-mark" aria-hidden="true">
+                    <span class="geo geo-circle"></span>
+                    <span class="geo geo-square"></span>
+                    <span class="geo geo-triangle"></span>
+                </div>
                 <h1>HKUgram</h1>
             </div>
             <div class="auth-copy">
@@ -1566,13 +1619,17 @@ def html_page(title: str, viewer_id: int, body: str, conn: sqlite3.Connection, a
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{escape(title)} | HKUgram</title>
-    <link rel="stylesheet" href="/static/style.css?v=20260415m">
+    <link rel="stylesheet" href="/static/style.css?v=20260415ui6">
 </head>
 <body data-page="{escape(active_nav)}" data-theme="light">
     <div class="app-shell">
         <header class="topbar">
             <div class="brand-block">
-                <div class="brand-mark">H</div>
+                <div class="brand-mark" aria-hidden="true">
+                    <span class="geo geo-circle"></span>
+                    <span class="geo geo-square"></span>
+                    <span class="geo geo-triangle"></span>
+                </div>
                 <h1>HKUgram</h1>
             </div>
             <form method="get" action="/" class="topbar-search-form" data-topbar-form>
@@ -1616,7 +1673,7 @@ def html_page(title: str, viewer_id: int, body: str, conn: sqlite3.Connection, a
         <a data-nav="ask" href="{url_with_viewer('/query', viewer_id)}">Ask</a>
         <a data-nav="notifications" href="{url_with_viewer('/notifications', viewer_id)}">Alerts{" (" + str(unread_notifications) + ")" if unread_notifications else ""}</a>
     </nav>
-    <script src="/static/app.js?v=20260415f"></script>
+    <script src="/static/app.js?v=20260415g"></script>
 </body>
 </html>"""
     return page.encode("utf-8")
@@ -1974,6 +2031,13 @@ def render_messages_page(conn: sqlite3.Connection, params: dict[str, list[str]])
         f"<label class='toggle-label'><input type='checkbox' name='member_ids' value='{contact['user_id']}'> @{escape(contact['username'])}</label>"
         for contact in contacts
     ) or "<p class='muted'>No available users for group creation yet.</p>"
+    group_create_controls = """
+    <input type="text" name="title" placeholder="Group name (optional)">
+    <label>
+        Search usernames
+        <input type="text" placeholder="Filter contacts by username" data-group-member-search>
+    </label>
+    """
 
     chat_panel_html = """
     <article class="dashboard-card">
@@ -2066,6 +2130,20 @@ def render_messages_page(conn: sqlite3.Connection, params: dict[str, list[str]])
                 """
             )
         message_rows_html = "".join(message_rows) or "<p class='muted'>No messages yet. Say hi.</p>"
+        add_member_form_html = ""
+        if int(conversation_meta["is_group"]) == 1:
+            add_member_form_html = f"""
+            <form method="post" action="/messages/add-member" class="group-member-form">
+                <input type="hidden" name="viewer" value="{viewer_id}">
+                <input type="hidden" name="conversation_id" value="{conversation_view['conversation_id']}">
+                <input type="hidden" name="return_to" value="{escape(url_with_viewer('/messages', viewer_id, conversation_id=conversation_view['conversation_id']))}">
+                <label>
+                    Add user by username
+                    <input type="text" name="username" placeholder="@username" maxlength="40" required>
+                </label>
+                <button class="action-button" type="submit">Add User</button>
+            </form>
+            """
         chat_panel_html = f"""
         <article class="dashboard-card chat-panel">
             <div class="chat-header">
@@ -2074,6 +2152,7 @@ def render_messages_page(conn: sqlite3.Connection, params: dict[str, list[str]])
                     <span class="muted">{escape(participants_line)}</span>
                 </div>
             </div>
+            {add_member_form_html}
             <div class="chat-body">
                 {message_rows_html}
             </div>
@@ -2105,8 +2184,8 @@ def render_messages_page(conn: sqlite3.Connection, params: dict[str, list[str]])
             <form method="post" action="/messages/create-group" class="dashboard-card">
                 <input type="hidden" name="viewer" value="{viewer_id}">
                 <input type="hidden" name="return_to" value="{escape(url_with_viewer('/messages', viewer_id, share_post_id=share_post['post_id'] if share_post else None))}">
-                <input type="text" name="title" placeholder="Group name (optional)">
-                <div class="thread-list">{group_member_options}</div>
+                {group_create_controls}
+                <div class="thread-list" data-group-member-list>{group_member_options}</div>
                 <button class="action-button" type="submit">Create Group</button>
             </form>
         </aside>
@@ -2418,6 +2497,14 @@ class HKUgramHandler(SimpleHTTPRequestHandler):
                         parsed_form.get("member_ids", []),
                     )
                     return
+                if parsed.path == "/messages/add-member":
+                    self.handle_add_group_member(
+                        conn,
+                        viewer_id,
+                        int(form["conversation_id"]),
+                        form.get("username", ""),
+                    )
+                    return
                 if parsed.path == "/messages/react":
                     self.handle_react_message(conn, viewer_id, int(form["message_id"]), form.get("reaction", ""))
                     return
@@ -2651,6 +2738,23 @@ class HKUgramHandler(SimpleHTTPRequestHandler):
             raise AppError("Invalid group members.") from exc
         conversation_id = create_group_conversation(conn, viewer_id, title, member_ids)
         self.respond_redirect(url_with_viewer("/messages", viewer_id, conversation_id=conversation_id))
+
+    def handle_add_group_member(
+        self,
+        conn: sqlite3.Connection,
+        viewer_id: int,
+        conversation_id: int,
+        username: str,
+    ) -> None:
+        _member_id, added_username = add_user_to_group_conversation(conn, viewer_id, conversation_id, username)
+        self.respond_redirect(
+            url_with_viewer(
+                "/messages",
+                viewer_id,
+                conversation_id=conversation_id,
+                flash=f"Added @{added_username} to the group.",
+            )
+        )
 
     def handle_react_message(self, conn: sqlite3.Connection, viewer_id: int, message_id: int, reaction: str) -> None:
         allowed_reactions = {"❤️", "👍", "😂", "🔥"}

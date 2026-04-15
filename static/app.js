@@ -99,4 +99,19 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     });
   }
+
+  const groupSearchInput = document.querySelector("[data-group-member-search]");
+  const groupMemberList = document.querySelector("[data-group-member-list]");
+  if (groupSearchInput && groupMemberList) {
+    const labels = Array.from(groupMemberList.querySelectorAll(".toggle-label"));
+    const syncGroupFilter = () => {
+      const needle = groupSearchInput.value.trim().toLowerCase();
+      labels.forEach((label) => {
+        const text = (label.textContent || "").toLowerCase();
+        label.hidden = Boolean(needle) && !text.includes(needle);
+      });
+    };
+    syncGroupFilter();
+    groupSearchInput.addEventListener("input", syncGroupFilter);
+  }
 });
