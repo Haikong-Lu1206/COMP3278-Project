@@ -2259,7 +2259,9 @@ def render_analytics_page(conn: sqlite3.Connection, params: dict[str, list[str]]
     def render_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
         header = "".join(f"<th>{escape(col.replace('_', ' ').title())}</th>" for col in columns)
         table_rows = "".join(
-            f"<tr>{''.join(f'<td>{escape(str(row.get(col, "")))}</td>' for col in columns)}</tr>"
+            "<tr>"
+            + "".join(f"<td>{escape(str(row.get(col, '')))}</td>" for col in columns)
+            + "</tr>"
             for row in rows
         )
         return f"<table><thead><tr>{header}</tr></thead><tbody>{table_rows}</tbody></table>"
