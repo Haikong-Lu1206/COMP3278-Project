@@ -41,7 +41,7 @@ Mac:
 ```
  export DEEPSEEK_API_KEY="your_key_here"
  export DEEPSEEK_MODEL="deepseek-chat"
- python3 app.py
+ python app.py
 ```
 
 PowerShell:
