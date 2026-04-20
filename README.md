@@ -30,10 +30,18 @@ Open: `http://127.0.0.1:8000`
 
 Set environment variables to enable API mode:
 
+WINDOWS:
 ```bash
 set DEEPSEEK_API_KEY=your_api_key_here
 set DEEPSEEK_MODEL=deepseek-chat
 python app.py
+```
+
+Mac:
+```
+ export DEEPSEEK_API_KEY="your_key_here"
+ export DEEPSEEK_MODEL="deepseek-chat"
+ python3 app.py
 ```
 
 PowerShell:
