@@ -66,6 +66,24 @@ Primary DB: `data/hkugram.db`
 - snapshot saved at shutdown to `data/snapshots/hkugram-latest.db`
 - automatic restore from snapshot if primary DB is missing
 
+## Troubleshooting
+
+ If you see User not found. after starting app.py, the app is usually using a
+  stale login cookie (hkugram_user) that points to a user ID no longer in the
+  local database.
+
+  Fix:
+
+   1. Open http://127.0.0.1:8000/logout to clear the session.
+   2. Refresh and log in/register again.
+
+  If the error still appears, reset local data and reseed:
+
+   rm -f data/hkugram.db data/snapshots/hkugram-latest.db
+   python3 app.py
+
+  This recreates a clean local database with seeded demo users.
+
 ## Deploy (Render)
 
 The repository includes `render.yaml` for quick Render setup.
